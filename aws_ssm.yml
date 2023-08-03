@@ -1,0 +1,224 @@
+# Add the following into the ssm_tags string whenever the path group name values have been
+# decided upon.   Key=PatchGroup,Value='{{ patch_group }}'
+# Also note that this requires the Controllers to have specific packages installed to perform
+# the AWS CLI functions: groff, unzip, less and of course the aws_cli which is sourced from:
+# "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+---
+- name: Install SSM Agent and Register Target
+  hosts: "{{ targets  }}"
+  gather_facts: true
+  vars:
+    os_type: "{{ ansible_os_family }}"
+    patch_group: "{{ patch_group }}"
+    ssm_tags: |
+        Key=os,Value={{ os_type }} Key=Creator,Value=AAP Key=Name,Value={{ ansible_hostname }} Key=Location,Value={{ location }}
+    ssm_id: '{{ lookup("env", "SSM_ID") }}'
+    ssm_secret: '{{ lookup("env", "SSM_KEY_SECRET") }}'
+    controller: '{{ lookup("env", "CONTROLLER_FQDN") }}'
+  tasks:
+    - name: Install and Register host to AWS SSM
+      block:
+        - name: Linux Registration Check Process
+          block:
+            - name: Find Instance ID for Linux
+              ansible.builtin.find:
+                path: /var/lib/amazon/ssm/
+                pattern: ['mi-*']
+                file_type: directory
+              register: nix_host
+
+            - name: Set Fact for Linux Instance ID
+              ansible.builtin.set_fact:
+                linux_id: "{{ nix_host | regex_search('mi-[a-zA-Z0-9]{17}') }}"
+
+            - name: Print Linux Instance ID if registered
+              ansible.builtin.debug:
+                msg: "Linux target is already registered with '{{ linux_id }}'"
+              when: 
+                - linux_id is search('mi-')
+
+            - name: End play for current Linux host if already registered
+              ansible.builtin.meta: end_host
+              when: linux_id is search('mi-') 
+          when: os_type in ['Debian', 'Ubuntu'] or ansible_os_family == 'RedHat'
+
+        - name: Windows Registration Check Process
+          block: 
+            - name: Find InstanceData Directory (Windows)
+              ansible.windows.win_find:
+                paths: "C:\\ProgramData\\Amazon\\SSM\\InstanceData"
+                patterns: ['mi-*']
+                file_type: directory
+              register: win_host
+
+            - name: Set Fact for Windows Instance ID
+              ansible.builtin.set_fact:
+                windows_id: "{{ win_host | regex_search('mi-[a-zA-Z0-9]{17}') }}" 
+              when: 
+                - win_host is defined
+
+            - name: Print Windows Instance ID if registered
+              ansible.builtin.debug:
+                msg: "Windows target is already registered with '{{ windows_id }}'"
+              when: 
+                - windows_id is search('mi-') 
+
+            - name: End play for current Windows host if already registered
+              ansible.builtin.meta: end_host
+              when: windows_id is search('mi-') 
+          when: ansible_os_family == 'Windows'
+
+        - name: Run AWS Configure
+          ansible.builtin.shell: "{{ item }}"
+          loop:
+            - aws configure set aws_access_key_id {{ ssm_id }}
+            - aws configure set aws_secret_access_key {{ ssm_secret }}
+          delegate_to: '{{ controller }}'
+          
+        - name: Set region fact for Activation
+          set_fact:
+            activation_region: |
+              {% set first_three_letters = ansible_hostname[:3] %}
+              {% if first_three_letters == 'nyc' %}
+                "us-east-2"
+              {% elif first_three_letters == 'prt' %}
+                "us-east-2"
+              {% elif first_three_letters == 'chi' %}
+                "us-east-2"
+              {% elif first_three_letters == 'prs' %} 
+                "eu-west-1"
+              {% elif first_three_letters == 'dub' %}
+                "eu-west-1"
+              {% elif first_three_letters == 'lon' %}
+                "eu-west-1"
+              {% elif first_three_letters == 'tyo' %}
+                "ap-northeast-1"
+              {% else %}
+                "us-east-2"
+              {% endif %}
+
+        - name: Set region fact for Registration
+          set_fact:
+            registration_region: "{{ activation_region | regex_replace('^\\s*\"|\"\\s*$', '') }}"
+
+        - name: Set location fact
+          ansible.builtin.set_fact:
+            location: '{{ ansible_hostname[:3] }}'
+
+        - name: Set patch_group fact based on os_type
+          ansible.builtin.set_fact:
+            patch_group: >
+              {% if os_type in ['Ubuntu'] or ['CentOS'] %}
+              {{ os_type }}-Prod
+              {% elif ansible_os_family == 'Windows' or ansible_os_family == 'RedHat' %}
+              {{ ansible_os_family }}-Prod
+              {% else %}
+                "Unknown"
+              {% endif %}
+
+        - name: Create SSM activation
+          ansible.builtin.command: |
+            aws ssm create-activation
+              --description "A new activation created by 'Ansible' for '{{ ansible_hostname }}'."
+              --default-instance-name '{{ ansible_hostname }}'
+              --iam-role "SSM"
+              --registration-limit 1
+              --region {{ activation_region }}
+              --tags {{ ssm_tags }}
+          register: ssm_activation
+          delegate_to: '{{ controller }}'
+
+        - name: Set Activation Facts
+          ansible.builtin.set_fact:
+            code: "{{ ssm_activation.stdout | from_json | json_query('ActivationCode') }}"
+            id: "{{ ssm_activation.stdout | from_json | json_query('ActivationId') }}"
+
+        - name: Install SSM Agent (Debian/Ubuntu)
+          become: true
+          become_user: root
+          ansible.builtin.command: "sh -c 'curl https://s3.{{ registration_region }}.amazonaws.com/amazon-ssm-{{ registration_region }}/latest/debian_amd64/amazon-ssm-agent.deb -o /tmp/amazon-ssm-agent.deb && apt-get install -y /tmp/amazon-ssm-agent.deb'"
+          when: os_type in ['Debian', 'Ubuntu']
+
+        - name: Install SSM Agent (CentOS/RHEL)
+          become: true
+          become_user: root
+          ansible.builtin.command: "sh -c 'curl https://s3.{{ registration_region }}.amazonaws.com/amazon-ssm-{{ registration_region }}/latest/linux_amd64/amazon-ssm-agent.rpm -o /tmp/amazon-ssm-agent.rpm && yum install -y /tmp/amazon-ssm-agent.rpm'"
+          when: os_type in ['CentOS', 'RedHat']
+
+        - name: Register Target
+          become: true
+          become_user: root
+          ansible.builtin.command: amazon-ssm-agent -register -code {{ code }} -id {{ id }} -region {{ registration_region | regex_replace('\\s*') }}
+          timeout: 30
+          register: target_register
+          when: os_type not in ['Windows']
+
+        - name: Download Installer (Windows)
+          ansible.windows.win_get_url:
+            url: https://s3.{{ registration_region }}.amazonaws.com/amazon-ssm-{{ registration_region }}/latest/windows_amd64/AmazonSSMAgentSetup.exe
+            dest: C:\it_temp\AmazonSSMAgentSetup.exe
+          timeout: 30
+          when: ansible_os_family == 'Windows'
+
+        - name: Install and Register SSM Agent (Windows)
+          ansible.windows.win_package:
+            path: C:\it_temp\AmazonSSMAgentSetup.exe
+            state: present
+            arguments: /quiet /install /log install.log CODE={{ code }} ID={{ id }} REGION={{ registration_region }}
+          timeout: 45
+          register: target_register
+          when: ansible_os_family == 'Windows'
+
+        - name: Sleep for 20 seconds
+          wait_for:
+            timeout: 20
+          delegate_to: localhost
+  
+        - name: Restart SSM (Windows)
+          ansible.windows.win_service:
+            name: AmazonSSMAgent
+            state: restarted
+            start_mode: auto
+          when: ansible_os_family == 'Windows'
+          timeout: 30
+
+        - name: Print Register STDOUT
+          ansible.builtin.debug:
+            msg: "Registration output '{{ target_register }}'"
+
+      rescue:
+        - name: Deregister target
+          block:
+            - name: Deregister Linux Client
+              block:
+                - name: Set Variable for Managed Instance ID (linux)
+                  ansible.builtin.set_fact:
+                    man_id: "{{ target_register.stdout | regex_search('\\bmi-[a-zA-Z0-9]{17}\b') }}" 
+              
+                - name: Deregister Linux  
+                  ansible.builtin.command: aws ssm deregister-managed-instance --instance-id {{ man_id }} --region {{ registration_region }}
+                  ignore_errors: true
+              when: os_type not in ['Windows']
+
+            - name: Deregister Windows Client
+              block:
+                - name: Find InstanceData Directory (Windows)
+                  ansible.windows.win_find:
+                    paths: "C:\\ProgramData\\Amazon\\SSM\\InstanceData"
+                    patterns: ['mi-*']
+                    file_type: directory
+                  register: win_dirs
+
+                - name: Set Variable for Managed Instance ID (Windows)
+                  ansible.builtin.set_fact:
+                    man_id: "{{ win_dirs.files | map(attribute='path') | map('basename') | first }}"
+  
+                - name: Deregister Windows  
+                  ansible.builtin.command: aws ssm deregister-managed-instance --instance-id {{ man_id }} --region {{ registration_region }}
+                  ignore_errors: true
+              when: ansible_os_family == 'Windows'
+
+        - name: Delete Activation from AWS
+          ansible.builtin.command: aws ssm delete-activation --activation-id {{ id }} --region {{ registration_region }} --output text
+          delegate_to: localhost
+ 
